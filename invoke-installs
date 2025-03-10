@@ -1,0 +1,166 @@
+#Requires -RunAsAdministrator
+
+# Import the Configuration Manager module
+try {
+    Import-Module "$($ENV:SMS_ADMIN_UI_PATH)\..\ConfigurationManager.psd1" -ErrorAction Stop
+    Write-Host "Configuration Manager module imported successfully" -ForegroundColor Green
+} catch {
+    Write-Host "Error importing Configuration Manager module: $_" -ForegroundColor Red
+    exit
+}
+
+# Connect to the site
+$SiteCode = "YOUR_SITECODE"  # Replace with your site code
+$ProviderMachineName = "YOUR_SCCM_SERVER"  # Replace with your SCCM server name
+
+try {
+    Set-Location "$($SiteCode):" -ErrorAction Stop
+    Write-Host "Connected to site $SiteCode" -ForegroundColor Green
+} catch {
+    Write-Host "Error connecting to site: $_" -ForegroundColor Red
+    exit
+}
+
+# Function to display menu
+function Show-Menu {
+    Clear-Host
+    Write-Host "=== MECM Client Management Script ===" -ForegroundColor Cyan
+    Write-Host "1. List Available Packages"
+    Write-Host "2. List Available Applications"
+    Write-Host "3. List Available Task Sequences"
+    Write-Host "4. List Available Software Updates"
+    Write-Host "5. Install Selected Item"
+    Write-Host "6. Uninstall Selected Item"
+    Write-Host "7. Exit"
+}
+
+# Function to get available items
+function Get-AvailableItems {
+    param (
+        [string]$ItemType
+    )
+    
+    switch ($ItemType) {
+        "Packages" {
+            $items = Get-CMPackage | Where-Object { $_.IsEnabled -eq $true } | 
+                Select-Object Name, PackageID, Description
+            return $items
+        }
+        "Applications" {
+            $items = Get-CMApplication | Where-Object { $_.IsEnabled -eq $true } | 
+                Select-Object LocalizedDisplayName, SoftwareVersion, CI_UniqueID
+            return $items
+        }
+        "TaskSequences" {
+            $items = Get-CMTaskSequence | Where-Object { $_.IsEnabled -eq $true } | 
+                Select-Object Name, PackageID, Description
+            return $items
+        }
+        "SoftwareUpdates" {
+            $items = Get-CMSoftwareUpdate -Fast | Where-Object { $_.IsExpired -eq $false } | 
+                Select-Object LocalizedDisplayName, ArticleID, DatePosted
+            return $items
+        }
+    }
+}
+
+# Function to install item
+function Install-Item {
+    param (
+        [string]$ItemType,
+        [string]$ItemID
+    )
+    
+    try {
+        switch ($ItemType) {
+            "Package" {
+                Invoke-CMProgram -PackageId $ItemID -ProgramName "Install"
+            }
+            "Application" {
+                Install-CMApplication -Id $ItemID
+            }
+            "TaskSequence" {
+                Start-CMTaskSequence -TaskSequencePackageId $ItemID
+            }
+            "SoftwareUpdate" {
+                Invoke-CMSoftwareUpdateDeployment -ArticleId $ItemID
+            }
+        }
+        Write-Host "$ItemType installed successfully" -ForegroundColor Green
+    } catch {
+        Write-Host "Error installing $ItemType : $_" -ForegroundColor Red
+    }
+}
+
+# Function to uninstall item
+function Uninstall-Item {
+    param (
+        [string]$ItemType,
+        [string]$ItemID
+    )
+    
+    try {
+        switch ($ItemType) {
+            "Application" {
+                Uninstall-CMApplication -Id $ItemID
+            }
+            # Note: Packages and Task Sequences typically don't have uninstall options
+            # Software Updates are managed differently for uninstallation
+        }
+        Write-Host "$ItemType uninstalled successfully" -ForegroundColor Green
+    } catch {
+        Write-Host "Error uninstalling $ItemType : $_" -ForegroundColor Red
+    }
+}
+
+# Main script loop
+do {
+    Show-Menu
+    $choice = Read-Host "Enter your choice (1-7)"
+    
+    switch ($choice) {
+        "1" {
+            $items = Get-AvailableItems -ItemType "Packages"
+            $items | Format-Table -AutoSize
+            Pause
+        }
+        "2" {
+            $items = Get-AvailableItems -ItemType "Applications"
+            $items | Format-Table -AutoSize
+            Pause
+        }
+        "3" {
+            $items = Get-AvailableItems -ItemType "TaskSequences"
+            $items | Format-Table -AutoSize
+            Pause
+        }
+        "4" {
+            $items = Get-AvailableItems -ItemType "SoftwareUpdates"
+            $items | Format-Table -AutoSize
+            Pause
+        }
+        "5" {
+            $itemType = Read-Host "Enter item type (Package/Application/TaskSequence/SoftwareUpdate)"
+            $itemID = Read-Host "Enter item ID"
+            Install-Item -ItemType $itemType -ItemID $itemID
+            Pause
+        }
+        "6" {
+            $itemType = Read-Host "Enter item type (Application only for uninstall)"
+            $itemID = Read-Host "Enter item ID"
+            Uninstall-Item -ItemType $itemType -ItemID $itemID
+            Pause
+        }
+        "7" {
+            Write-Host "Exiting..." -ForegroundColor Yellow
+            break
+        }
+        default {
+            Write-Host "Invalid choice" -ForegroundColor Red
+            Pause
+        }
+    }
+} while ($choice -ne "7")
+
+# Return to original location
+Set-Location $PSScriptRoot
