@@ -1,8 +1,17 @@
 #Requires -RunAsAdministrator
 
-# Import the Configuration Manager module
+# Import the Configuration Manager module remotely
+$SiteServer = "YOUR_SCCM_SERVER"  # Replace with your SCCM server FQDN
+$SiteCode = "YOUR_SITECODE"      # Replace with your site code
+
 try {
-    Import-Module "$($ENV:SMS_ADMIN_UI_PATH)\..\ConfigurationManager.psd1" -ErrorAction Stop
+    # If running locally on the site server, use local path; otherwise, use PS session
+    if ($env:COMPUTERNAME -eq $SiteServer.Split('.')[0]) {
+        Import-Module "$($ENV:SMS_ADMIN_UI_PATH)\..\ConfigurationManager.psd1" -ErrorAction Stop
+    } else {
+        $session = New-PSSession -ComputerName $SiteServer -ErrorAction Stop
+        Import-Module -Name ConfigurationManager -PSSession $session -ErrorAction Stop
+    }
     Write-Host "Configuration Manager module imported successfully" -ForegroundColor Green
 } catch {
     Write-Host "Error importing Configuration Manager module: $_" -ForegroundColor Red
@@ -10,9 +19,6 @@ try {
 }
 
 # Connect to the site
-$SiteCode = "YOUR_SITECODE"  # Replace with your site code
-$ProviderMachineName = "YOUR_SCCM_SERVER"  # Replace with your SCCM server name
-
 try {
     Set-Location "$($SiteCode):" -ErrorAction Stop
     Write-Host "Connected to site $SiteCode" -ForegroundColor Green
@@ -24,134 +30,132 @@ try {
 # Function to display menu
 function Show-Menu {
     Clear-Host
-    Write-Host "=== MECM Client Management Script ===" -ForegroundColor Cyan
-    Write-Host "1. List Available Packages"
-    Write-Host "2. List Available Applications"
-    Write-Host "3. List Available Task Sequences"
-    Write-Host "4. List Available Software Updates"
-    Write-Host "5. Install Selected Item"
-    Write-Host "6. Uninstall Selected Item"
-    Write-Host "7. Exit"
+    Write-Host "=== Remote MECM Client Management Script ===" -ForegroundColor Cyan
+    Write-Host "1. List Available Applications for Device"
+    Write-Host "2. List Available Software Updates for Device"
+    Write-Host "3. Install Item on Device"
+    Write-Host "4. Uninstall Application on Device"
+    Write-Host "5. Exit"
 }
 
-# Function to get available items
-function Get-AvailableItems {
+# Function to get device-specific available items
+function Get-DeviceAvailableItems {
     param (
+        [string]$DeviceName,
         [string]$ItemType
     )
     
+    # Get device resource ID
+    $resource = Get-CMDevice -Name $DeviceName
+    if (-not $resource) {
+        Write-Host "Device $DeviceName not found" -ForegroundColor Red
+        return $null
+    }
+    $resourceID = $resource.ResourceID
+
     switch ($ItemType) {
-        "Packages" {
-            $items = Get-CMPackage | Where-Object { $_.IsEnabled -eq $true } | 
-                Select-Object Name, PackageID, Description
-            return $items
-        }
         "Applications" {
-            $items = Get-CMApplication | Where-Object { $_.IsEnabled -eq $true } | 
-                Select-Object LocalizedDisplayName, SoftwareVersion, CI_UniqueID
-            return $items
-        }
-        "TaskSequences" {
-            $items = Get-CMTaskSequence | Where-Object { $_.IsEnabled -eq $true } | 
-                Select-Object Name, PackageID, Description
-            return $items
+            # Query available applications for the device
+            $apps = Get-WmiObject -Namespace "root\CCM\ClientSDK" -Class CCM_Application `
+                -ComputerName $DeviceName | Where-Object { $_.InstallState -eq "NotInstalled" -or $_.InstallState -eq "Installed" }
+            return $apps | Select-Object Name, Id, Revision, InstallState
         }
         "SoftwareUpdates" {
-            $items = Get-CMSoftwareUpdate -Fast | Where-Object { $_.IsExpired -eq $false } | 
-                Select-Object LocalizedDisplayName, ArticleID, DatePosted
-            return $items
+            # Query available software updates for the device
+            $updates = Get-WmiObject -Namespace "root\CCM\ClientSDK" -Class CCM_SoftwareUpdate `
+                -ComputerName $DeviceName | Where-Object { $_.ComplianceState -eq 0 }  # 0 = Not compliant (needs update)
+            return $updates | Select-Object Name, ArticleID, ComplianceState, EvaluationState
         }
     }
 }
 
-# Function to install item
+# Function to install item on remote device
 function Install-Item {
     param (
+        [string]$DeviceName,
         [string]$ItemType,
-        [string]$ItemID
+        [string]$ItemID,
+        [string]$Revision = "1"  # Default revision, adjust if needed
     )
     
     try {
         switch ($ItemType) {
-            "Package" {
-                Invoke-CMProgram -PackageId $ItemID -ProgramName "Install"
-            }
             "Application" {
-                Install-CMApplication -Id $ItemID
-            }
-            "TaskSequence" {
-                Start-CMTaskSequence -TaskSequencePackageId $ItemID
+                $app = Get-WmiObject -Namespace "root\CCM\ClientSDK" -Class CCM_Application `
+                    -ComputerName $DeviceName | Where-Object { $_.Id -eq $ItemID }
+                if ($app) {
+                    $null = ([wmiclass]"\\$DeviceName\root\CCM\ClientSDK:CCM_Application").Install($ItemID, $Revision, $true, 0, "Normal", $false)
+                    Write-Host "Installation of $ItemType '$($app.Name)' triggered on $DeviceName" -ForegroundColor Green
+                }
             }
             "SoftwareUpdate" {
-                Invoke-CMSoftwareUpdateDeployment -ArticleId $ItemID
+                $update = Get-WmiObject -Namespace "root\CCM\ClientSDK" -Class CCM_SoftwareUpdate `
+                    -ComputerName $DeviceName | Where-Object { $_.ArticleID -eq $ItemID }
+                if ($update) {
+                    $null = ([wmiclass]"\\$DeviceName\root\CCM\ClientSDK:CCM_SoftwareUpdatesManager").InstallUpdates(@($update))
+                    Write-Host "Installation of update '$($update.Name)' triggered on $DeviceName" -ForegroundColor Green
+                }
             }
         }
-        Write-Host "$ItemType installed successfully" -ForegroundColor Green
     } catch {
-        Write-Host "Error installing $ItemType : $_" -ForegroundColor Red
+        Write-Host "Error installing $ItemType on $DeviceName : $_" -ForegroundColor Red
     }
 }
 
-# Function to uninstall item
+# Function to uninstall application on remote device
 function Uninstall-Item {
     param (
-        [string]$ItemType,
-        [string]$ItemID
+        [string]$DeviceName,
+        [string]$ItemID,
+        [string]$Revision = "1"  # Default revision
     )
     
     try {
-        switch ($ItemType) {
-            "Application" {
-                Uninstall-CMApplication -Id $ItemID
-            }
-            # Note: Packages and Task Sequences typically don't have uninstall options
-            # Software Updates are managed differently for uninstallation
+        $app = Get-WmiObject -Namespace "root\CCM\ClientSDK" -Class CCM_Application `
+            -ComputerName $DeviceName | Where-Object { $_.Id -eq $ItemID }
+        if ($app -and $app.InstallState -eq "Installed") {
+            $null = ([wmiclass]"\\$DeviceName\root\CCM\ClientSDK:CCM_Application").Uninstall($ItemID, $Revision, 0, "Normal", $false)
+            Write-Host "Uninstallation of '$($app.Name)' triggered on $DeviceName" -ForegroundColor Green
+        } else {
+            Write-Host "Application not installed or not found" -ForegroundColor Yellow
         }
-        Write-Host "$ItemType uninstalled successfully" -ForegroundColor Green
     } catch {
-        Write-Host "Error uninstalling $ItemType : $_" -ForegroundColor Red
+        Write-Host "Error uninstalling application on $DeviceName : $_" -ForegroundColor Red
     }
 }
 
 # Main script loop
 do {
     Show-Menu
-    $choice = Read-Host "Enter your choice (1-7)"
+    $choice = Read-Host "Enter your choice (1-5)"
     
     switch ($choice) {
         "1" {
-            $items = Get-AvailableItems -ItemType "Packages"
-            $items | Format-Table -AutoSize
+            $device = Read-Host "Enter target device name (e.g., DeviceA)"
+            $items = Get-DeviceAvailableItems -DeviceName $device -ItemType "Applications"
+            if ($items) { $items | Format-Table -AutoSize }
             Pause
         }
         "2" {
-            $items = Get-AvailableItems -ItemType "Applications"
-            $items | Format-Table -AutoSize
+            $device = Read-Host "Enter target device name (e.g., DeviceA)"
+            $items = Get-DeviceAvailableItems -DeviceName $device -ItemType "SoftwareUpdates"
+            if ($items) { $items | Format-Table -AutoSize }
             Pause
         }
         "3" {
-            $items = Get-AvailableItems -ItemType "TaskSequences"
-            $items | Format-Table -AutoSize
+            $device = Read-Host "Enter target device name (e.g., DeviceA)"
+            $itemType = Read-Host "Enter item type (Application/SoftwareUpdate)"
+            $itemID = Read-Host "Enter item ID (e.g., Application ID or ArticleID)"
+            Install-Item -DeviceName $device -ItemType $itemType -ItemID $itemID
             Pause
         }
         "4" {
-            $items = Get-AvailableItems -ItemType "SoftwareUpdates"
-            $items | Format-Table -AutoSize
+            $device = Read-Host "Enter target device name (e.g., DeviceA)"
+            $itemID = Read-Host "Enter Application ID to uninstall"
+            Uninstall-Item -DeviceName $device -ItemID $itemID
             Pause
         }
         "5" {
-            $itemType = Read-Host "Enter item type (Package/Application/TaskSequence/SoftwareUpdate)"
-            $itemID = Read-Host "Enter item ID"
-            Install-Item -ItemType $itemType -ItemID $itemID
-            Pause
-        }
-        "6" {
-            $itemType = Read-Host "Enter item type (Application only for uninstall)"
-            $itemID = Read-Host "Enter item ID"
-            Uninstall-Item -ItemType $itemType -ItemID $itemID
-            Pause
-        }
-        "7" {
             Write-Host "Exiting..." -ForegroundColor Yellow
             break
         }
@@ -160,7 +164,8 @@ do {
             Pause
         }
     }
-} while ($choice -ne "7")
+} while ($choice -ne "5")
 
-# Return to original location
+# Clean up
+if ($session) { Remove-PSSession $session }
 Set-Location $PSScriptRoot
