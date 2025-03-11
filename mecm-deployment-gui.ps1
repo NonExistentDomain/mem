@@ -1,4 +1,4 @@
-﻿#Requires -Modules ConfigurationManager
+#Requires -Modules ConfigurationManager
 <#
 .SYNOPSIS
     GUI-based MECM Deployment Automation Tool for managing deployments and collections.
@@ -60,7 +60,7 @@ function Write-Output {
         [string]$Color = "Black"
     )
     
-    $outputTextBox.SelectionColor = $Color
+    $outputTextBox.SelectionColor = [System.Drawing.Color]::$Color
     $outputTextBox.AppendText("$Text`r`n")
     $outputTextBox.ScrollToCaret()
 }
@@ -180,7 +180,9 @@ $tabControl.Size = New-Object System.Drawing.Size(765, 240)
 $tabControl.Enabled = $false
 $mainForm.Controls.Add($tabControl)
 
+###############################################
 # Application Deployment Tab
+###############################################
 $tabApplication = New-Object System.Windows.Forms.TabPage
 $tabApplication.Text = "Application Deployment"
 
@@ -292,69 +294,80 @@ $appDeadlineCheck.Add_CheckedChanged({
     $appOverrideCheck.Enabled = $appDeadlineCheck.Checked
 })
 
+# Modified Application Deployment: Run deployment asynchronously
 $appDeployButton = New-Object System.Windows.Forms.Button
 $appDeployButton.Text = "Deploy Application"
 $appDeployButton.Location = New-Object System.Drawing.Point(150, 150)
 $appDeployButton.Size = New-Object System.Drawing.Size(150, 30)
 $appDeployButton.Add_Click({
-    try {
-        $appName = $appNameComboBox.Text.Trim()
-        $collName = $appCollectionComboBox.Text.Trim()
-        $purpose = $appPurposeComboBox.SelectedItem.ToString()
-        
-        if (-not $appName -or -not $collName) {
-            [System.Windows.Forms.MessageBox]::Show("Please enter Application Name and Collection Name", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-            return
-        }
-        
-        Write-Output -Text "Deploying application '$appName' to collection '$collName'..." -Color "Blue"
-        
-        # Verify application exists
-        $application = Get-CMApplication -Name $appName -ErrorAction Stop
-        if (-not $application) {
-            Write-Output -Text "Application '$appName' not found" -Color "Red"
-            return
-        }
-        
-        # Verify collection exists
-        $collection = Get-CMCollection -Name $collName -ErrorAction Stop
-        if (-not $collection) {
-            Write-Output -Text "Collection '$collName' not found" -Color "Red"
-            return
-        }
-        
-        # Set deployment parameters
-        $deploymentParams = @{
-            Application = $appName
-            Collection = $collName
-            DeployPurpose = $purpose
-            DeployAction = "Install"
-            UserNotification = "DisplayAll"
-            AllowRepairApp = $true
-            TimeBaseOn = "LocalTime"
-            AvailableDateTime = (Get-Date)
-        }
-        
-        # Add deadline if provided
-        if ($appDeadlineCheck.Checked) {
-            $deploymentParams.Add("DeadlineDateTime", $appDeadlinePicker.Value)
-            $deploymentParams.Add("OverrideServiceWindow", $appOverrideCheck.Checked)
-        }
-        
-        # Create deployment
-        $deployment = New-CMApplicationDeployment @deploymentParams -ErrorAction Stop
-        
-        Write-Output -Text "Successfully deployed application '$appName' to collection '$collName'" -Color "Green"
+    # Disable button to prevent duplicate clicks
+    $appDeployButton.Enabled = $false
+
+    $appName = $appNameComboBox.Text.Trim()
+    $collName = $appCollectionComboBox.Text.Trim()
+    $purpose = $appPurposeComboBox.SelectedItem.ToString()
+    
+    if (-not $appName -or -not $collName) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter Application Name and Collection Name", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        $appDeployButton.Enabled = $true
+        return
     }
-    catch {
-        Write-Output -Text "Failed to create application deployment: $_" -Color "Red"
+    
+    Write-Output -Text "Deploying application '$appName' to collection '$collName'..." -Color "Blue"
+    
+    # Start asynchronous deployment via a background job
+    $job = Start-Job -ScriptBlock {
+         param($appName, $collName, $purpose, $deadlineChecked, $deadlineValue, $overrideCheck)
+         try {
+             Import-Module ConfigurationManager -ErrorAction Stop
+             $application = Get-CMApplication -Name $appName -ErrorAction Stop
+             if (-not $application) { throw "Application '$appName' not found" }
+             $collection = Get-CMCollection -Name $collName -ErrorAction Stop
+             if (-not $collection) { throw "Collection '$collName' not found" }
+             $deploymentParams = @{
+                Application     = $appName
+                Collection      = $collName
+                DeployPurpose   = $purpose
+                DeployAction    = "Install"
+                UserNotification= "DisplayAll"
+                AllowRepairApp  = $true
+                TimeBaseOn      = "LocalTime"
+                AvailableDateTime = (Get-Date)
+             }
+             if ($deadlineChecked) {
+                $deploymentParams.Add("DeadlineDateTime", $deadlineValue)
+                $deploymentParams.Add("OverrideServiceWindow", $overrideCheck)
+             }
+             $deployment = New-CMApplicationDeployment @deploymentParams -ErrorAction Stop
+             "Successfully deployed application '$appName' to collection '$collName'"
+         }
+         catch {
+             "Failed to create application deployment: $_"
+         }
+    } -ArgumentList $appName, $collName, $purpose, $appDeadlineCheck.Checked, $appDeadlinePicker.Value, $appOverrideCheck.Checked
+
+    # Register an event to monitor job completion and update UI accordingly
+    Register-ObjectEvent -InputObject $job -EventName StateChanged -SourceIdentifier "AppDeploy_$($job.Id)" -Action {
+         if ($EventArgs.JobStateInfo.State -eq 'Completed') {
+              $result = Receive-Job -Job $Event.Sender
+              $outputTextBox.Invoke([Action]{
+                  $outputTextBox.SelectionColor = [System.Drawing.Color]::Green
+                  $outputTextBox.AppendText("$result`r`n")
+                  $outputTextBox.ScrollToCaret()
+              })
+              $appDeployButton.Invoke([Action]{ $appDeployButton.Enabled = $true })
+              Unregister-Event -SourceIdentifier "AppDeploy_$($Event.Sender.Id)"
+              Remove-Job -Job $Event.Sender
+         }
     }
 })
 $tabApplication.Controls.Add($appDeployButton)
 
 $tabControl.Controls.Add($tabApplication)
 
+###############################################
 # Package Deployment Tab
+###############################################
 $tabPackage = New-Object System.Windows.Forms.TabPage
 $tabPackage.Text = "Package Deployment"
 
@@ -497,79 +510,82 @@ $pkgDeadlineCheck.Add_CheckedChanged({
     $pkgOverrideCheck.Enabled = $pkgDeadlineCheck.Checked
 })
 
+# Modified Package Deployment: Run deployment asynchronously
 $pkgDeployButton = New-Object System.Windows.Forms.Button
 $pkgDeployButton.Text = "Deploy Package"
 $pkgDeployButton.Location = New-Object System.Drawing.Point(150, 170)
 $pkgDeployButton.Size = New-Object System.Drawing.Size(150, 30)
 $pkgDeployButton.Add_Click({
-    try {
-        $pkgName = $pkgNameComboBox.Text.Trim()
-        $progName = $progNameComboBox.Text.Trim()
-        $collName = $pkgCollectionComboBox.Text.Trim()
-        $purpose = $pkgPurposeComboBox.SelectedItem.ToString()
-        
-        if (-not $pkgName -or -not $progName -or -not $collName) {
-            [System.Windows.Forms.MessageBox]::Show("Please enter Package Name, Program Name, and Collection Name", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-            return
-        }
-        
-        Write-Output -Text "Deploying package '$pkgName' with program '$progName' to collection '$collName'..." -Color "Blue"
-        
-        # Verify package exists
-        $package = Get-CMPackage -Name $pkgName -ErrorAction Stop
-        if (-not $package) {
-            Write-Output -Text "Package '$pkgName' not found" -Color "Red"
-            return
-        }
-        
-        # Verify program exists in package
-        $program = Get-CMProgram -PackageName $pkgName -ProgramName $progName -ErrorAction Stop
-        if (-not $program) {
-            Write-Output -Text "Program '$progName' not found in package '$pkgName'" -Color "Red"
-            return
-        }
-        
-        # Verify collection exists
-        $collection = Get-CMCollection -Name $collName -ErrorAction Stop
-        if (-not $collection) {
-            Write-Output -Text "Collection '$collName' not found" -Color "Red"
-            return
-        }
-        
-        # Set deployment parameters
-        $deploymentParams = @{
-            Package = $pkgName
-            Program = $progName
-            Collection = $collName
-            DeployPurpose = $purpose
-            StandardProgram = $true
-            FastNetworkOption = "DownloadContentFromDistributionPointAndRunLocally"
-            SlowNetworkOption = "DownloadContentFromDistributionPointAndLocally"
-            UserNotification = "DisplayAll"
-            TimeBaseOn = "LocalTime"
-            AvailableDateTime = (Get-Date)
-        }
-        
-        # Add deadline if provided
-        if ($pkgDeadlineCheck.Checked) {
-            $deploymentParams.Add("DeadlineDateTime", $pkgDeadlinePicker.Value)
-            $deploymentParams.Add("OverrideServiceWindow", $pkgOverrideCheck.Checked)
-        }
-        
-        # Create deployment
-        $deployment = New-CMPackageDeployment @deploymentParams -ErrorAction Stop
-        
-        Write-Output -Text "Successfully deployed package '$pkgName' with program '$progName' to collection '$collName'" -Color "Green"
+    $pkgDeployButton.Enabled = $false
+
+    $pkgName = $pkgNameComboBox.Text.Trim()
+    $progName = $progNameComboBox.Text.Trim()
+    $collName = $pkgCollectionComboBox.Text.Trim()
+    $purpose = $pkgPurposeComboBox.SelectedItem.ToString()
+    
+    if (-not $pkgName -or -not $progName -or -not $collName) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter Package Name, Program Name, and Collection Name", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        $pkgDeployButton.Enabled = $true
+        return
     }
-    catch {
-        Write-Output -Text "Failed to create package deployment: $_" -Color "Red"
+    
+    Write-Output -Text "Deploying package '$pkgName' with program '$progName' to collection '$collName'..." -Color "Blue"
+    
+    $job = Start-Job -ScriptBlock {
+         param($pkgName, $progName, $collName, $purpose, $deadlineChecked, $deadlineValue, $overrideCheck)
+         try {
+             Import-Module ConfigurationManager -ErrorAction Stop
+             $package = Get-CMPackage -Name $pkgName -ErrorAction Stop
+             if (-not $package) { throw "Package '$pkgName' not found" }
+             $program = Get-CMProgram -PackageName $pkgName -ProgramName $progName -ErrorAction Stop
+             if (-not $program) { throw "Program '$progName' not found in package '$pkgName'" }
+             $collection = Get-CMCollection -Name $collName -ErrorAction Stop
+             if (-not $collection) { throw "Collection '$collName' not found" }
+             $deploymentParams = @{
+                Package         = $pkgName
+                Program         = $progName
+                Collection      = $collName
+                DeployPurpose   = $purpose
+                StandardProgram = $true
+                FastNetworkOption = "DownloadContentFromDistributionPointAndRunLocally"
+                SlowNetworkOption = "DownloadContentFromDistributionPointAndLocally"
+                UserNotification  = "DisplayAll"
+                TimeBaseOn      = "LocalTime"
+                AvailableDateTime = (Get-Date)
+             }
+             if ($deadlineChecked) {
+                $deploymentParams.Add("DeadlineDateTime", $deadlineValue)
+                $deploymentParams.Add("OverrideServiceWindow", $overrideCheck)
+             }
+             $deployment = New-CMPackageDeployment @deploymentParams -ErrorAction Stop
+             "Successfully deployed package '$pkgName' with program '$progName' to collection '$collName'"
+         }
+         catch {
+             "Failed to create package deployment: $_"
+         }
+    } -ArgumentList $pkgName, $progName, $collName, $purpose, $pkgDeadlineCheck.Checked, $pkgDeadlinePicker.Value, $pkgOverrideCheck.Checked
+
+    Register-ObjectEvent -InputObject $job -EventName StateChanged -SourceIdentifier "PkgDeploy_$($job.Id)" -Action {
+         if ($EventArgs.JobStateInfo.State -eq 'Completed') {
+              $result = Receive-Job -Job $Event.Sender
+              $outputTextBox.Invoke([Action]{
+                  $outputTextBox.SelectionColor = [System.Drawing.Color]::Green
+                  $outputTextBox.AppendText("$result`r`n")
+                  $outputTextBox.ScrollToCaret()
+              })
+              $pkgDeployButton.Invoke([Action]{ $pkgDeployButton.Enabled = $true })
+              Unregister-Event -SourceIdentifier "PkgDeploy_$($Event.Sender.Id)"
+              Remove-Job -Job $Event.Sender
+         }
     }
 })
 $tabPackage.Controls.Add($pkgDeployButton)
 
 $tabControl.Controls.Add($tabPackage)
 
+###############################################
 # Software Update Deployment Tab
+###############################################
 $tabSoftwareUpdate = New-Object System.Windows.Forms.TabPage
 $tabSoftwareUpdate.Text = "Software Update Deployment"
 
@@ -677,77 +693,85 @@ $suDeployNameTextBox.Location = New-Object System.Drawing.Point(150, 140)
 $suDeployNameTextBox.Size = New-Object System.Drawing.Size(300, 20)
 $tabSoftwareUpdate.Controls.Add($suDeployNameTextBox)
 
+# Modified Software Update Deployment: Run deployment asynchronously
 $suDeployButton = New-Object System.Windows.Forms.Button
 $suDeployButton.Text = "Deploy Updates"
 $suDeployButton.Location = New-Object System.Drawing.Point(150, 170)
 $suDeployButton.Size = New-Object System.Drawing.Size(150, 30)
 $suDeployButton.Add_Click({
-    try {
-        $sugName = $sugNameComboBox.Text.Trim()
-        $collName = $suCollectionComboBox.Text.Trim()
-        $deployName = $suDeployNameTextBox.Text.Trim()
-        
-        if (-not $sugName -or -not $collName -or -not $deployName) {
-            [System.Windows.Forms.MessageBox]::Show("Please enter Update Group Name, Collection Name, and Deployment Name", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-            return
-        }
-        
-        Write-Output -Text "Deploying software update group '$sugName' to collection '$collName'..." -Color "Blue"
-        
-        # Verify update group exists
-        $updateGroup = Get-CMSoftwareUpdateGroup -Name $sugName -ErrorAction Stop
-        if (-not $updateGroup) {
-            Write-Output -Text "Software update group '$sugName' not found" -Color "Red"
-            return
-        }
-        
-        # Verify collection exists
-        $collection = Get-CMCollection -Name $collName -ErrorAction Stop
-        if (-not $collection) {
-            Write-Output -Text "Collection '$collName' not found" -Color "Red"
-            return
-        }
-        
-        # Set deployment parameters
-        $deploymentParams = @{
-            SoftwareUpdateGroupName = $sugName
-            CollectionName = $collName
-            DeploymentName = $deployName
-            DeploymentType = "Required"
-            EnforcementDeadline = $suDeadlinePicker.Value
-            TimeBasedOn = "LocalTime"
-            UserNotification = "DisplayAll"
-            AvailableDateTime = (Get-Date)
-            OverrideServiceWindows = $suOverrideCheck.Checked
-            RestartServer = $false
-            RestartWorkstation = $false
-            SendWakeupPacket = $true
-            VerboseLevel = "AllMessages"
-        }
-        
-        # Set download option
-        if ($suDownloadCheck.Checked) {
-            $deploymentParams.Add("DownloadFromMicrosoftUpdate", $false)
-            $deploymentParams.Add("SoftwareInstallation", $true)
-        } else {
-            $deploymentParams.Add("DownloadFromMicrosoftUpdate", $true)
-            $deploymentParams.Add("SoftwareInstallation", $false)
-        }
-        
-        # Create deployment
-        $deployment = New-CMSoftwareUpdateDeployment @deploymentParams -ErrorAction Stop
-        
-        Write-Output -Text "Successfully deployed software update group '$sugName' to collection '$collName'" -Color "Green"
+    $suDeployButton.Enabled = $false
+
+    $sugName = $sugNameComboBox.Text.Trim()
+    $collName = $suCollectionComboBox.Text.Trim()
+    $deployName = $suDeployNameTextBox.Text.Trim()
+    
+    if (-not $sugName -or -not $collName -or -not $deployName) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter Update Group Name, Collection Name, and Deployment Name", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        $suDeployButton.Enabled = $true
+        return
     }
-    catch {
-        Write-Output -Text "Failed to create software update deployment: $_" -Color "Red"
+    
+    Write-Output -Text "Deploying software update group '$sugName' to collection '$collName'..." -Color "Blue"
+    
+    $job = Start-Job -ScriptBlock {
+         param($sugName, $collName, $deployName, $deadlineValue, $overrideCheck, $downloadChecked)
+         try {
+             Import-Module ConfigurationManager -ErrorAction Stop
+             $updateGroup = Get-CMSoftwareUpdateGroup -Name $sugName -ErrorAction Stop
+             if (-not $updateGroup) { throw "Software update group '$sugName' not found" }
+             $collection = Get-CMCollection -Name $collName -ErrorAction Stop
+             if (-not $collection) { throw "Collection '$collName' not found" }
+             $deploymentParams = @{
+                SoftwareUpdateGroupName = $sugName
+                CollectionName          = $collName
+                DeploymentName          = $deployName
+                DeploymentType          = "Required"
+                EnforcementDeadline     = $deadlineValue
+                TimeBasedOn             = "LocalTime"
+                UserNotification        = "DisplayAll"
+                AvailableDateTime       = (Get-Date)
+                OverrideServiceWindows  = $overrideCheck
+                RestartServer           = $false
+                RestartWorkstation      = $false
+                SendWakeupPacket        = $true
+                VerboseLevel            = "AllMessages"
+             }
+             if ($downloadChecked) {
+                 $deploymentParams.Add("DownloadFromMicrosoftUpdate", $false)
+                 $deploymentParams.Add("SoftwareInstallation", $true)
+             } else {
+                 $deploymentParams.Add("DownloadFromMicrosoftUpdate", $true)
+                 $deploymentParams.Add("SoftwareInstallation", $false)
+             }
+             $deployment = New-CMSoftwareUpdateDeployment @deploymentParams -ErrorAction Stop
+             "Successfully deployed software update group '$sugName' to collection '$collName'"
+         }
+         catch {
+             "Failed to create software update deployment: $_"
+         }
+    } -ArgumentList $sugName, $collName, $deployName, $suDeadlinePicker.Value, $suOverrideCheck.Checked, $suDownloadCheck.Checked
+
+    Register-ObjectEvent -InputObject $job -EventName StateChanged -SourceIdentifier "SuDeploy_$($job.Id)" -Action {
+         if ($EventArgs.JobStateInfo.State -eq 'Completed') {
+              $result = Receive-Job -Job $Event.Sender
+              $outputTextBox.Invoke([Action]{
+                  $outputTextBox.SelectionColor = [System.Drawing.Color]::Green
+                  $outputTextBox.AppendText("$result`r`n")
+                  $outputTextBox.ScrollToCaret()
+              })
+              $suDeployButton.Invoke([Action]{ $suDeployButton.Enabled = $true })
+              Unregister-Event -SourceIdentifier "SuDeploy_$($Event.Sender.Id)"
+              Remove-Job -Job $Event.Sender
+         }
     }
 })
 $tabSoftwareUpdate.Controls.Add($suDeployButton)
 
 $tabControl.Controls.Add($tabSoftwareUpdate)
 
+###############################################
 # Collection Management Tab
+###############################################
 $tabCollection = New-Object System.Windows.Forms.TabPage
 $tabCollection.Text = "Collection Management"
 
