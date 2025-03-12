@@ -1,0 +1,24 @@
+# Log off all users
+$output = quser
+$lines = $output -split "`n"
+foreach ($line in $lines[1..($lines.Length-1)]) {
+    if ($line -match '\d+') {
+        $id = $matches[0]
+        logoff $id
+    }
+}
+
+# Wait for 30 seconds to ensure logoff processes complete
+Start-Sleep -Seconds 30
+
+# Delete profiles ending with .sa, excluding special profiles
+$profiles = Get-CimInstance -ClassName Win32_UserProfile
+foreach ($profile in $profiles) {
+    if (-not $profile.Special) {
+        $path = $profile.LocalPath
+        $username = $path -split '\\' | Select-Object -Last 1
+        if ($username -like '*.sa') {
+            $profile | Remove-CimInstance
+        }
+    }
+}
