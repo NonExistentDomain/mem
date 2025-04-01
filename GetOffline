@@ -1,0 +1,29 @@
+Import-Module ActiveDirectory
+# MECM setup if needed
+function Test-ComputerOfflineStatus {
+    param ($ComputerName, $MECMThresholdMinutes = 60, $ADThresholdMinutes = 1440)
+    $result = [PSCustomObject]@{
+        ComputerName = $ComputerName
+        Pingable = Test-Connection -ComputerName $ComputerName -Count 2 -Quiet
+        MECMLastOnline = (Get-CMDevice -Name $ComputerName).LastActiveTime
+        ADLastOnline = [DateTime]::FromFileTime((Get-ADComputer -Filter "Name -eq '$ComputerName'" -Properties LastLogonTimeStamp).LastLogonTimeStamp)
+    }
+    # Check thresholds
+    $mecmOffline = ($result.MECMLastOnline -and ((Get-Date) - $result.MECMLastOnline).TotalMinutes -gt $MECMThresholdMinutes)
+    $adOffline = ($result.ADLastOnline -and ((Get-Date) - $result.ADLastOnline).TotalMinutes -gt $ADThresholdMinutes)
+    if ($result.Pingable -and ($mecmOffline -or $adOffline)) {
+        try {
+            $wmiResult = Get-WmiObject -Class Win32_ComputerSystem -ComputerName $ComputerName
+            if ($wmiResult.Name -eq $ComputerName) {
+                return "Online (Identity confirmed via WMI)"
+            } else {
+                return "Offline (Pingable IP belongs to another device)"
+            }
+        } catch {
+            return "Offline (No WMI response, likely not the target computer)"
+        }
+    }
+    return "Offline (No recent management data)" if $mecmOffline -and $adOffline else "Online (Recent activity)"
+}
+
+------------------------------------------------------------------------------------------------------------
