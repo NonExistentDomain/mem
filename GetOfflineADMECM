@@ -1,0 +1,114 @@
+# Requires ActiveDirectory and ConfigurationManager modules
+Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+$SiteCode = "PS1"  # Adjust to your SCCM site code
+$SCCMServer = "SCCM-SERVER.domain.com"  # Adjust to your SCCM server
+if (Test-Path "$env:SMS_ADMIN_UI_PATH\..\ConfigurationManager.psd1") {
+    Import-Module "$env:SMS_ADMIN_UI_PATH\..\ConfigurationManager.psd1"
+    Set-Location "$SiteCode`:"
+}
+
+# Function to verify if a computer is truly offline
+function Test-ComputerOfflineStatus {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$ComputerName,
+        [int]$ADThresholdMinutes = 60,  # Consider offline if no AD logon in last X minutes
+        [int]$MECMThresholdMinutes = 60  # Consider offline if no MECM heartbeat in last X minutes
+    )
+
+    # Initialize result object
+    $result = [PSCustomObject]@{
+        ComputerName    = $ComputerName
+        IPAddress       = $null
+        Pingable        = $false
+        ADLastOnline    = $null
+        ADStatus        = "Unknown"
+        MECMLastOnline  = $null
+        MECMStatus      = "Unknown"
+        IdentityVerified = $false
+        Conclusion      = "Unknown"
+    }
+
+    # Step 1: Resolve IP and check ping (for context, not definitive)
+    try {
+        $dnsResult = Resolve-DnsName -Name $ComputerName -ErrorAction Stop
+        $result.IPAddress = $dnsResult.IPAddress
+        $result.Pingable = Test-Connection -ComputerName $ComputerName -Count 2 -Quiet -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warning "DNS resolution failed for $ComputerName : $_"
+    }
+
+    # Step 2: Check AD last logon (authoritative for domain authentication)
+    if (Get-Module ActiveDirectory -ErrorAction SilentlyContinue) {
+        $adComputer = Get-ADComputer -Filter "Name -eq '$ComputerName'" `
+                                    -Properties LastLogonTimeStamp -ErrorAction SilentlyContinue
+        if ($adComputer -and $adComputer.LastLogonTimeStamp) {
+            $result.ADLastOnline = [DateTime]::FromFileTime($adComputer.LastLogonTimeStamp)
+            $adTimeDiff = (Get-Date) - $result.ADLastOnline
+            if ($adTimeDiff.TotalMinutes -gt $ADThresholdMinutes) {
+                $result.ADStatus = "Offline (No recent AD authentication)"
+            } else {
+                $result.ADStatus = "Online (Recent AD authentication)"
+            }
+        } else {
+            $result.ADStatus = "No AD data or never logged on"
+        }
+    } else {
+        Write-Warning "ActiveDirectory module not available"
+    }
+
+    # Step 3: Check MECM last active time (more precise heartbeat data)
+    if (Get-Command Get-CMDevice -ErrorAction SilentlyContinue) {
+        $mecmDevice = Get-CMDevice -Name $ComputerName -ErrorAction SilentlyContinue
+        if ($mecmDevice -and $mecmDevice.LastActiveTime) {
+            $result.MECMLastOnline = $mecmDevice.LastActiveTime
+            $mecmTimeDiff = (Get-Date) - $result.MECMLastOnline
+            if ($mecmTimeDiff.TotalMinutes -gt $MECMThresholdMinutes) {
+                $result.MECMStatus = "Offline (No recent MECM heartbeat)"
+            } else {
+                $result.MECMStatus = "Online (Recent MECM heartbeat)"
+            }
+        } else {
+            $result.MECMStatus = "No MECM data"
+        }
+    } else {
+        Write-Warning "MECM module not available or not connected to site"
+    }
+
+    # Step 4: Direct identity check (optional, if pingable and tools inconclusive)
+    if ($result.Pingable -and ($result.ADStatus -eq "Offline" -or $result.MECMStatus -eq "Offline")) {
+        try {
+            # Attempt WMI query to verify hostname matches
+            $wmiResult = Get-WmiObject -Class Win32_ComputerSystem -ComputerName $ComputerName `
+                                      -ErrorAction Stop
+            if ($wmiResult.Name -eq $ComputerName) {
+                $result.IdentityVerified = $true
+                $result.Conclusion = "Online (Identity confirmed via WMI)"
+            } else {
+                $result.IdentityVerified = $false
+                $result.Conclusion = "Offline (Pingable IP belongs to another device)"
+            }
+        } catch {
+            $result.Conclusion = "Offline (No WMI response, likely not the target computer)"
+        }
+    }
+
+    # Step 5: Final conclusion based on available data
+    if (-not $result.Conclusion -or $result.Conclusion -eq "Unknown") {
+        if ($result.MECMLastOnline -and $result.MECMStatus -eq "Offline") {
+            $result.Conclusion = "Offline (Per MECM heartbeat)"
+        } elseif ($result.ADLastOnline -and $result.ADStatus -eq "Offline") {
+            $result.Conclusion = "Offline (Per AD last logon)"
+        } elseif ($result.Pingable) {
+            $result.Conclusion = "Possibly Online (Pingable but identity unverified)"
+        } else {
+            $result.Conclusion = "Offline (Not pingable and no recent management data)"
+        }
+    }
+
+    # Output result
+    $result
+}
+
+# Example usage
+Test-ComputerOfflineStatus -ComputerName "WORKSTATION01" -ADThresholdMinutes 60 -MECMThresholdMinutes 60
