@@ -1,4 +1,4 @@
-@{
+
 # Requires ActiveDirectory and ConfigurationManager modules
 Import-Module ActiveDirectory -ErrorAction SilentlyContinue
 $SiteCode = "PS1"  # Adjust to your SCCM site code
@@ -719,7 +719,6 @@ Get-TrellixComputerLastOnline -ComputerName "WORKSTATION01"
 
 
 
-}
 
 
 
